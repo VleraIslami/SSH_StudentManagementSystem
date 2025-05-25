@@ -8,10 +8,10 @@ import { CartContext, ProfileContext } from "./views/plugin/Context";
 import Search from "./views/base/Search";
 
 import Register from "../src/views/auth/Register";
-import StudentDashbord from "views/student/Dashbord";
+import StudentDashbord from "views/student/Dashboard";
 
-import StudentCourse from "viws/student/Courses";
-import Courses from "viws/student/Courses";
+import StudentCourse from "views/student/Courses";
+import Courses from "views/student/Courses";
 import StudentCourseDetail from "./views/student/CourseDetail";
 
 import CourseDetail from "./views/base/CourseDetail";
@@ -48,9 +48,7 @@ function App() {
 
     //console.log("cartCount", cartCount);
 
-    useAxios()
-      .get(`user/profile/${UserData()?.user_id}/`)
-      .then((res) => {
+    useAxios().get(`user/profile/${UserData()?.user_id}/`).then((res) => {
         setProfile(res.data);
       });
   }, []);

@@ -1,26 +1,48 @@
-from django.shortcuts import render
+from django.shortcuts import render, redirect
 from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.conf import settings
-from django.contrib.auth.hashers import change_password, check_password
-from django.contrib.auth.models import User
-from django.http import JsonResponse
+from django.contrib.auth.hashers import check_password
 from django.db import models
-
+from django.db.models.functions import ExtractMonth
+from django.core.files.uploadedfile import InMemoryUploadedFile
+from django.http import JsonResponse
 
 from api import serializer as api_serializer
 from api import models as api_models
-from userauths.models import Profile
+from userauths.models import User, Profile
 
 from rest_framework_simplejwt.views import TokenObtainPairView
-from rest_framework import generics, status
-from rest_framework.permissions import AllowAny
+from rest_framework import generics, status, viewsets
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.response import Response
+from rest_framework.decorators import api_view, APIView
 
-from datetime import datetime,timedelta
+
 import random
 from decimal import Decimal
+import stripe
+import requests
+from datetime import datetime, timedelta
+from distutils.util import strtobool
+
+
+# Updates
+from django.core.files.storage import default_storage
+import os
+from moviepy.editor import VideoFileClip
+from django.core.files.base import ContentFile
+import math
+from rest_framework.parsers import MultiPartParser, FormParser
+from drf_yasg.utils import swagger_auto_schema
+from drf_yasg import openapi
+from django.core.files.uploadedfile import InMemoryUploadedFile
+
+
+stripe.api_key = settings.STRIPE_SECRET_KEY
+PAYPAL_CLIENT_ID = settings.PAYPAL_CLIENT_ID
+
 
 
 class MyTokenObtainPairView(TokenObtainPairView):
@@ -127,30 +149,26 @@ class PasswordChangeApiView(generics.CreateAPIView):
 
 
 
-class ChangePasswordAPIView(generics.APIView):
+class ChangePasswordAPIView(APIView):
     serializer_class = api_serializer.UserSerializer
     permission_classes = [AllowAny]
 
-    def create(self, request, *args, **kwargs):
-        user_id = request.data['user_id']
-        old_password = request.data['old_password']
-        new_password = request.data['new_password']
+    def post(self, request, *args, **kwargs):
+        user_id = request.data.get('user_id')
+        old_password = request.data.get('old_password')
+        new_password = request.data.get('new_password')
 
-        user=User.objects.get(id=user_id)
-        if user is not None:
-            if check_password(old_password, user.password):
-                user.set_password(new_password)
-                user.save()
-                return Response({"message": "Password changed successfully", "icon": "success"})
-            else:
-                return Response({"message": "Old password is incorrect", "icon": "warning"})
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"message": "User does not exist", "icon": "error"}, status=status.HTTP_404_NOT_FOUND)
+
+        if check_password(old_password, user.password):
+            user.set_password(new_password)
+            user.save()
+            return Response({"message": "Password changed successfully", "icon": "success"})
         else:
-            return Response({"message": "User does not exist", "icon": "error"})
-
-
-
-
-
+            return Response({"message": "Old password is incorrect", "icon": "warning"})
 
 class ProfileAPIView(generics.RetrieveUpdateAPIView):
     serializer_class = api_serializer.ProfileSerializer
@@ -167,14 +185,11 @@ class CategoryListAPIView(generics.ListAPIView):
     serializer_class = api_serializer.CategorySerializer
     permission_classes = [AllowAny]
 
-
-
 class CourseListAPIView(generics.ListAPIView):
     queryset = api_models.Course.objects.filter(
         platform_status="Published", teacher_course_status="Published")
     serializer_class = api_serializer.CourseSerializer
     permission_classes = [AllowAny]
-
 
 class CourseDetailAPIView(generics.RetrieveAPIView):
     serializer_class = api_serializer.CourseSerializer
@@ -189,7 +204,6 @@ class CourseDetailAPIView(generics.RetrieveAPIView):
         course = api_models.Course.objects.get(
             slug=slug, platform_status="Published", teacher_course_status="Published")
         return course
-
 
 class CartAPIView(generics.CreateAPIView):
     queryset = api_models.Cart.objects.all()
@@ -431,9 +445,6 @@ class CouponApplyAPIView(generics.CreateAPIView):
 
 
 
-#payment
-#
-#
 
 class SearchCourseAPIView(generics.ListAPIView):
     serializer_class = api_serializer.CourseSerializer
@@ -611,7 +622,7 @@ def update_password_view(request):
             return JsonResponse({"error": "User not found."}, status=404)
 
 class StudentWishListCreateAPIView(generics.ListCreateAPIView):
-    serializer_class = api_serializer.WishListSerializer
+    serializer_class = api_serializer.WishlistSerializer
     permission_classes = [AllowAny]
 
     def get_queryset(self):
@@ -681,12 +692,6 @@ class QuestionAnswerMessageSendAPIView(generics.CreateAPIView):
 
         return Response({"message": "Message sent!", "question": question_serializer.data})
 
-
-
-
-
-
-
 class TeacherSummaryAPIView(generics.ListAPIView):
     serializer_class = api_serializer.TeacherSummarySerializer
     permission_classes = [AllowAny]
@@ -694,41 +699,467 @@ class TeacherSummaryAPIView(generics.ListAPIView):
     def get_queryset(self):
         teacher_id = self.kwargs['teacher_id']
         teacher = api_models.Teacher.objects.get(id=teacher_id)
+        
+        one_month_ago = datetime.now() - timedelta(days=28)
+        
+        total_courses = api_models.Course.objects.filter(teacher=teacher).count()
+        
+        total_revenue = api_models.CartOrderItem.objects.filter(
+            teacher=teacher,
+            order_payment_status="Paid"
+        ).aggregate(total_revenue=models.Sum("price"))["total_revenue"] or 0
 
-       one_month_ago = datetime.now() - timedelta(days=28)
-       
-       total_courses = api_models.Course.objects.filter(teacher=teacher).count()
-       total_revenue = api_models.CartOrderItem.objects.filter(teacher=teacher, order_payment_status="Paid").aggregate(total_revenue=models.Sum("price"))["total_revenue"]or 0   
-       monthly_revenue = api_models.CartOrderItem.objects.filter(teacher=teacher, order_payment_status="Paid",date_gte=one_month_ago).aggregate(total_revenue=models.Sum("price")["total_revenue"]or 0)
+        monthly_revenue = api_models.CartOrderItem.objects.filter(
+            teacher=teacher,
+            order_payment_status="Paid",
+            date__gte=one_month_ago
+        ).aggregate(total_revenue=models.Sum("price"))["total_revenue"] or 0
 
-   
-       enrolled_course=api_models.EnrolledCourse.objects.filter(teacher=teacher)
-       unique_students_ids = set(_)
-       students=[]
+        enrolled_courses = api_models.EnrolledCourse.objects.filter(teacher=teacher)
+        unique_student_ids = set()
+        students = []
 
-       for course in enrolled_courses:
-           if course.user_id not in unique_student_ids:
-              user=User.objects.get(id=course.user_id)
-               student={
-                "full_name": user.profile.first_name,
-                "image": user.profile.image.url,
-                "country":user.profile.country,,
-                "date":course.data
-         }
-
-
-
-            students.append(student)
-            unique_student_ids.add(course.user_id)
+        for course in enrolled_courses:
+            if course.user_id not in unique_student_ids:
+                user = User.objects.get(id=course.user_id)
+                student = {
+                    "full_name": user.profile.first_name,
+                    "image": user.profile.image.url,
+                    "country": user.profile.country,
+                    "date": course.date
+                }
+                students.append(student)
+                unique_student_ids.add(course.user_id)
 
         return [{
-            total_courses: total_courses,
+            "total_courses": total_courses,
             "total_revenue": total_revenue,
             "monthly_revenue": monthly_revenue,
-            "total_students""len(students),
+            "total_students": len(students),
         }]
 
-    def list(self, request , *args, **kwargs):
+    def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+    
+class TeacherCourseListAPIView(generics.ListAPIView):
+    serializer_class = api_serializer.CourseSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        teacher_id = self.kwargs['teacher_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Course.objects.filter(teacher=teacher)
+    
+class TeacherReviewListAPIView(generics.ListAPIView):
+    serializer_class = api_serializer.ReviewSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        teacher_id = self.kwargs['teacher_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Review.objects.filter(course__teacher=teacher)
+
+class TeacherReviewDetailAPIView(generics.RetrieveUpdateAPIView):
+    serializer_class = api_serializer.ReviewSerializer
+    permission_classes = [AllowAny]
+
+    def get_object(self):
+        teacher_id = self.kwargs['teacher_id']
+        review_id = self.kwargs['review_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Review.objects.get(course__teacher=teacher, id=review_id)
+    
+class TeacherStudentsListAPIView(viewsets.ViewSet):
+
+    def list(self, request, teacher_id=None):
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+
+        enrolled_courses = api_models.EnrolledCourse.objects.filter(teacher=teacher)
+        unique_student_ids = set()
+        students = []
+
+        for course in enrolled_courses:
+            if course.user_id not in unique_student_ids:
+                user = User.objects.get(id=course.user_id)
+                student = {
+                    "full_name": user.profile.full_name,
+                    "image": user.profile.image.url if user.profile.image else None,
+                    "country": user.profile.country,
+                    "date": course.date
+                }
+
+                students.append(student)
+                unique_student_ids.add(course.user_id)
+
+        return Response(students)
+    
+@api_view(("GET", ))
+def TeacherAllMonthEarningAPIView(request, teacher_id):
+    teacher = api_models.Teacher.objects.get(id=teacher_id)
+    monthly_earning_tracker = (
+        api_models.CartOrderItem.objects
+        .filter(teacher=teacher, order__payment_status="Paid")
+        .annotate(
+            month=ExtractMonth("date")
+        )
+        .values("month")
+        .annotate(
+            total_earning=models.Sum("price")
+        )
+        .order_by("month")
+    )
+
+    return Response(monthly_earning_tracker)
+
+class TeacherBestSellingCourseAPIView(viewsets.ViewSet):
+
+    def list(self, request, teacher_id=None):
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        courses_with_total_price = []
+        courses = api_models.Course.objects.filter(teacher=teacher)
+
+        for course in courses:
+            revenue = course.enrolledcourse_set.aggregate(total_price=models.Sum('order_item__price'))['total_price'] or 0
+            sales = course.enrolledcourse_set.count()
+
+            courses_with_total_price.append({
+                'course_image': course.image.url,
+                'course_title': course.title,
+                'revenue': revenue,
+                'sales': sales,
+            })
+
+        return Response(courses_with_total_price)
+    
+class TeacherCourseOrdersListAPIView(generics.ListAPIView):
+    serializer_class = api_serializer.CartOrderItemSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        teacher_id = self.kwargs['teacher_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+
+        return api_models.CartOrderItem.objects.filter(teacher=teacher)
+
+class TeacherQuestionAnswerListAPIView(generics.ListAPIView):
+    serializer_class = api_serializer.Question_AnswerSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        teacher_id = self.kwargs['teacher_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Question_Answer.objects.filter(course__teacher=teacher)
+    
+class TeacherCouponListCreateAPIView(generics.ListCreateAPIView):
+    serializer_class = api_serializer.CouponSerializer
+    permission_classes = [AllowAny]
+    
+    def get_queryset(self):
+        teacher_id = self.kwargs['teacher_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Coupon.objects.filter(teacher=teacher)
+    
+class TeacherCouponDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = api_serializer.CouponSerializer
+    permission_classes = [AllowAny]
+    
+    def get_object(self):
+        teacher_id = self.kwargs['teacher_id']
+        coupon_id = self.kwargs['coupon_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Coupon.objects.get(teacher=teacher, id=coupon_id)
+    
+class TeacherNotificationListAPIView(generics.ListAPIView):
+    serializer_class = api_serializer.NotificationSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        teacher_id = self.kwargs['teacher_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Notification.objects.filter(teacher=teacher, seen=False)
+    
+class TeacherNotificationDetailAPIView(generics.RetrieveUpdateAPIView):
+    serializer_class = api_serializer.NotificationSerializer
+    permission_classes = [AllowAny]
+
+    def get_object(self):
+        teacher_id = self.kwargs['teacher_id']
+        noti_id = self.kwargs['noti_id']
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        return api_models.Notification.objects.get(teacher=teacher, id=noti_id)
+    
+
+class CourseCreateAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        title = request.data.get("title")
+        description = request.data.get("description")
+        image = request.data.get("image")
+        file = request.data.get("file")
+        level = request.data.get("level")
+        language = request.data.get("language")
+        price = request.data.get("price")
+        category = request.data.get("category")
+
+        category_obj = api_models.Category.objects.filter(id=category).first()
+        teacher = api_models.Teacher.objects.get(user=request.user)
+
+        course = api_models.Course.objects.create(
+            teacher=teacher,
+            category=category_obj,
+            file=file,
+            image=image,
+            title=title,
+            description=description,
+            price=price,
+            language=language,
+            level=level
+        )
+
+        return Response({"message": "Course Created", "course_id": course.course_id}, status=status.HTTP_201_CREATED)
+
+
+class CourseUpdateAPIView(generics.RetrieveUpdateAPIView):
+    queryset = api_models.Course.objects.all()
+    serializer_class = api_serializer.CourseSerializer
+    permission_classes = [AllowAny]
+
+    def get_object(self):
+        teacher_id = self.kwargs['teacher_id']
+        course_id = self.kwargs['course_id']
+
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        course = api_models.Course.objects.get(course_id=course_id)
+
+        return course
+    
+    def update(self, request, *args, **kwargs):
+        course = self.get_object()
+        serializer = self.get_serializer(course, data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        if "image" in request.data and isinstance(request.data['image'], InMemoryUploadedFile):
+            course.image = request.data['image']
+        elif 'image' in request.data and str(request.data['image']) == "No File":
+            course.image = None
+        
+        if 'file' in request.data and not str(request.data['file']).startswith("http://"):
+            course.file = request.data['file']
+
+        if 'category' in request.data['category'] and request.data['category'] != 'NaN' and request.data['category'] != "undefined":
+            category = api_models.Category.objects.get(id=request.data['category'])
+            course.category = category
+
+        self.perform_update(serializer)
+        self.update_variant(course, request.data)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    def strtobool(val):
+        val = val.lower()
+        if val in ('y', 'yes', 't', 'true', 'on', '1'):
+            return 1
+        elif val in ('n', 'no', 'f', 'false', 'off', '0'):
+            return 0
+        else:
+            raise ValueError(f"invalid truth value {val}")
+
+    def update_variant(self, course, request_data):
+        for key, value in request_data.items():
+            if key.startswith("variants") and '[variant_title]' in key:
+
+                index = key.split('[')[1].split(']')[0]
+                title = value
+
+                id_key = f"variants[{index}][variant_id]"
+                variant_id = request_data.get(id_key)
+
+                variant_data = {'title': title}
+                item_data_list = []
+                current_item = {}
+
+            for item_key, item_value in request_data.items():
+                if f'variants[{index}][items]' in item_key:
+                    field_name = item_key.split('[')[-1].split(']')[0]
+                    if field_name == "title":
+                        if current_item:
+                            item_data_list.append(current_item)
+                        current_item = {}
+                    current_item.update({field_name: item_value})
+
+            if current_item:
+                item_data_list.append(current_item)
+
+            existing_variant = course.variant_set.filter(id=variant_id).first()
+
+            if existing_variant:
+                existing_variant.title = title
+                existing_variant.save()
+
+                for item_data in item_data_list[1:]:
+                    preview_value = item_data.get("preview")
+                    preview = bool(strtobool(str(preview_value))) if preview_value is not None else False
+
+                    variant_item = api_models.VariantItem.objects.filter(
+                        variant_item_id=item_data.get("variant_item_id")
+                    ).first()
+
+                    if not str(item_data.get("file")).startswith("http://"):
+                        if item_data.get("file") != "null":
+                            file = item_data.get("file")
+                        else:
+                            file = None
+
+                        title = item_data.get("title")
+                        description = item_data.get("description")
+
+                        if variant_item:
+                            variant_item.title = title
+                            variant_item.description = description
+                            variant_item.file = file
+                            variant_item.preview = preview
+                        else:
+                            variant_item = api_models.VariantItem.objects.create(
+                                variant=existing_variant,
+                                title=title,
+                                description=description,
+                                file=file,
+                                preview=preview
+                            )
+
+                    else:
+                        title = item_data.get("title")
+                        description = item_data.get("description")
+
+                        if variant_item:
+                            variant_item.title = title
+                            variant_item.description = description
+                            variant_item.preview = preview
+                        else:
+                            variant_item = api_models.VariantItem.objects.create(
+                                variant=existing_variant,
+                                title=title,
+                                description=description,
+                                preview=preview
+                            )
+
+                    variant_item.save()
+
+            else:
+                new_variant = api_models.Variant.objects.create(
+                    course=course, title=title
+                )
+
+                for item_data in item_data_list:
+                    preview_value = item_data.get("preview")
+                    preview = bool(strtobool(str(preview_value))) if preview_value is not None else False
+
+                    api_models.VariantItem.objects.create(
+                        variant=new_variant,
+                        title=item_data.get("title"),
+                        description=item_data.get("description"),
+                        file=item_data.get("file"),
+                        preview=preview,
+                    )
+
+    def save_nested_data(self, course_instance, serializer_class, data):
+        serializer = serializer_class(data=data, many=True, context={"course_instance": course_instance})
+        serializer.is_valid(raise_exception=True)
+        serializer.save(course=course_instance) 
+
+class CourseDetailAPIView(generics.RetrieveDestroyAPIView):
+    serializer_class = api_serializer.CourseSerializer
+    permission_classes = [AllowAny]
+
+    def get_object(self):
+        slug = self.kwargs['slug']
+        return api_models.Course.objects.get(slug=slug)
+
+class CourseVariantDeleteAPIView(generics.DestroyAPIView):
+    serializer_class = api_serializer.VariantSerializer
+    permission_classes = [AllowAny]
+
+    def get_object(self):
+        variant_id = self.kwargs['variant_id']
+        teacher_id = self.kwargs['teacher_id']
+        course_id = self.kwargs['course_id']
+
+        print("variant_id ========", variant_id)
+
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        course = api_models.Course.objects.get(teacher=teacher, course_id=course_id)
+        return api_models.Variant.objects.get(id=variant_id)
+    
+class CourseVariantItemDeleteAPIVIew(generics.DestroyAPIView):
+
+    serializer_class = api_serializer.VariantItemSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self):
+        variant_id = self.kwargs['variant_id']
+        variant_item_id = self.kwargs['variant_item_id']
+        teacher_id = self.kwargs['teacher_id']
+        course_id = self.kwargs['course_id']
+
+
+        teacher = api_models.Teacher.objects.get(id=teacher_id)
+        course = api_models.Course.objects.get(teacher=teacher, course_id=course_id)
+        variant = api_models.Variant.objects.get(variant_id=variant_id, course=course)
+        return api_models.VariantItem.objects.get(variant=variant, variant_item_id=variant_item_id)
+    
+
+class FileUploadAPIView(APIView):
+    permission_classes = [AllowAny]
+    parser_classes = (MultiPartParser, FormParser,)  # Allow file uploads
+
+    @swagger_auto_schema(
+        operation_description="Upload a file",
+        request_body=api_serializer.FileUploadSerializer,  # Use the serializer here
+        responses={
+            200: openapi.Response('File uploaded successfully', openapi.Schema(type=openapi.TYPE_OBJECT)),
+            400: openapi.Response('No file provided', openapi.Schema(type=openapi.TYPE_OBJECT)),
+        }
+    )
+
+    def post(self, request):
+        
+        serializer = api_serializer.FileUploadSerializer(data=request.data)  
+
+        if serializer.is_valid():
+            file = serializer.validated_data.get("file")
+
+            # Save the file to the media directory
+            file_path = default_storage.save(file.name, ContentFile(file.read()))
+            file_url = request.build_absolute_uri(default_storage.url(file_path))
+
+            # Check if the file is a video by inspecting its extension
+            if file.name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                # Calculate the video duration
+                file_full_path = os.path.join(default_storage.location, file_path)
+                clip = VideoFileClip(file_full_path)
+                duration_seconds = clip.duration
+
+                # Calculate minutes and seconds
+                minutes, remainder = divmod(duration_seconds, 60)
+                minutes = math.floor(minutes)
+                seconds = math.floor(remainder)
+
+                duration_text = f"{minutes}m {seconds}s"
+
+                print("url ==========", file_url)
+                print("duration_seconds ==========", duration_seconds)
+
+                # Return both the file URL and the video duration
+                return Response({
+                    "url": file_url,
+                    "video_duration": duration_text
+                })
+
+            # If not a video, just return the file URL
+            return Response({
+                    "url": file_url,
+            })
+
+        return Response({"error": "No file provided"}, status=400)

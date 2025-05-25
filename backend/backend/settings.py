@@ -16,6 +16,8 @@ from datetime import timedelta
 from environs import Env
 env = Env()
 env.read_env()
+print("STRIPE_SECRET_KEY:", env.str("STRIPE_SECRET_KEY", default="NOT SET"))
+print("PAYPAL_CLIENT_ID:", env.str("PAYPAL_CLIENT_ID", default="NOT SET"))
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -137,7 +139,8 @@ STATIC_URL = 'static/'
 STATICFILES_DIRS = [os.path.join(BASE_DIR, "static")]
 
 STATIC_ROOT = BASE_DIR / 'templates'
-
+STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY")
+PAYPAL_CLIENT_ID = env("PAYPAL_CLIENT_ID")
 MEDIA_URL = '/media/'  # menyra qysh e thirrim eshte psh 127.0.0.1/media/emri i fotos
 MEDIA_ROOT = BASE_DIR / 'media'
 
